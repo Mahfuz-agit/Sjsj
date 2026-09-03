@@ -19,24 +19,83 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # gradle-wrapper.jar is not present in this project (see README),
-      # so we provision Gradle itself instead of relying on ./gradlew.
-      # This action puts a working `gradle` command on PATH.
+      # gradle-wrapper.jar is not present in the extracted project, so we
+      # provision Gradle itself and call it directly instead of ./gradlew.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
 
+      - name: Find and extract the uploaded ZIP
+        id: extract
+        run: |
+          set -euo pipefail
+
+          # Find the first .zip file anywhere in the checked-out repo,
+          # excluding anything under .git.
+          ZIP_PATH=$(find "$GITHUB_WORKSPACE" -type f -name "*.zip" -not -path "*/.git/*" | head -n 1)
+
+          if [ -z "$ZIP_PATH" ]; then
+            echo "::error::No .zip file found in the repository."
+            exit 1
+          fi
+          echo "Found zip: $ZIP_PATH"
+
+          EXTRACT_DIR="$RUNNER_TEMP/extracted-project"
+          mkdir -p "$EXTRACT_DIR"
+          unzip -q "$ZIP_PATH" -d "$EXTRACT_DIR"
+
+          echo "extract_dir=$EXTRACT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Locate Android project root (contains settings.gradle[.kts])
+        id: locate
+        run: |
+          set -euo pipefail
+
+          EXTRACT_DIR="${{ steps.extract.outputs.extract_dir }}"
+
+          SETTINGS_FILE=$(find "$EXTRACT_DIR" -maxdepth 6 \
+            \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+            | head -n 1)
+
+          if [ -z "$SETTINGS_FILE" ]; then
+            echo "::error::Could not find settings.gradle or settings.gradle.kts anywhere under the extracted ZIP."
+            find "$EXTRACT_DIR" -maxdepth 4
+            exit 1
+          fi
+
+          PROJECT_ROOT=$(dirname "$SETTINGS_FILE")
+          echo "Detected Android project root: $PROJECT_ROOT"
+          echo "project_root=$PROJECT_ROOT" >> "$GITHUB_OUTPUT"
+
       - name: Build debug APK
-        working-directory: project/notesapp
+        working-directory: ${{ steps.locate.outputs.project_root }}
         run: gradle assembleDebug --stacktrace
 
-      # Path must not contain "/./" — actions/upload-artifact@v4 rejects it.
-      # Do not combine a "./"-prefixed path with working-directory; use one
-      # full, clean relative path from the repo root instead.
+      - name: Find generated APK
+        id: findapk
+        run: |
+          set -euo pipefail
+
+          PROJECT_ROOT="${{ steps.locate.outputs.project_root }}"
+
+          APK_PATH=$(find "$PROJECT_ROOT" -type f -name "*.apk" -path "*/outputs/apk/debug/*" | head -n 1)
+
+          if [ -z "$APK_PATH" ]; then
+            echo "::error::No debug APK found under $PROJECT_ROOT after the build."
+            find "$PROJECT_ROOT" -type f -name "*.apk"
+            exit 1
+          fi
+
+          echo "Found APK: $APK_PATH"
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+
+      # apk_path is already a full, clean absolute path from the previous
+      # step — no "./" segment, so it satisfies upload-artifact@v4's
+      # pattern rules as-is.
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: project/notesapp/app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ steps.findapk.outputs.apk_path }}
           if-no-files-found: error
